@@ -1,0 +1,86 @@
+name: CI/CD - Build, Scan, Push to ACR
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: todo-list
+  TRIVY_VERSION: 0.58.1
+
+jobs:
+  # ---------- CI: can we build a secure image? ----------
+  ci:
+    name: CI - Build and Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Security scan with Trivy (fail on fixable CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:${{ env.TRIVY_VERSION }} image \
+            --severity CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Save image for the CD job
+        run: docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} | gzip > image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 1
+
+  # ---------- CD: publish the image that passed CI ----------
+  cd:
+    name: CD - Push to Azure Container Registry
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC token for Azure login, no stored password
+      contents: read
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: gunzip -c image.tar.gz | docker load
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Tag Docker image
+        run: |
+          REGISTRY=${{ vars.ACR_NAME }}.azurecr.io
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} $REGISTRY/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} $REGISTRY/${{ env.IMAGE_NAME }}:latest
+
+      - name: Push Docker image
+        run: docker push --all-tags ${{ vars.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}
+
+      - name: Verify image exists in registry
+        run: az acr repository show-tags --name ${{ vars.ACR_NAME }} --repository ${{ env.IMAGE_NAME }} -o table
